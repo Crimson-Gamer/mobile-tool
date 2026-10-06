@@ -3,7 +3,7 @@
   "displayName": "Mobile Tools",
   "author": "Dark_Matter",
   "version": "3.1.0",
-  "description": "Client-side mobile tools including build assistance, auto mining, rebuilding, anti-grief alerts, range and power overlays, upgrade tools, and quick chat.",
+  "description": "Quick bar + tabbed menu: help builders, build planner, auto mine (incl. wall ores), heal at repair point, speed boost, anti-grief with rebuild, overlays, mod-user detection.",
   "minGameVersion": 146,
   "hidden": true
 }
