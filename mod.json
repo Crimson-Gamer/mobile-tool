@@ -2,7 +2,7 @@
   "name": "mobile-tools",
   "displayName": "Mobile Tools",
   "author": "Dark_Matter",
-  "version": "2.5.0",
+  "version": "3.1.0",
   "description": "Client-side mobile tools including build assistance, auto mining, rebuilding, anti-grief alerts, range and power overlays, upgrade tools, and quick chat.",
   "minGameVersion": 146,
   "hidden": true
