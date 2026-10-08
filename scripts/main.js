@@ -7,21 +7,25 @@ var S = {
   // help builders
   assist: false, targetId: -1, circle: true, orbit: 6, copyShoot: true, farReset: true, farTiles: 100, skipModUsers: true,
   // mining
-  mine: false, mineMatch: true, mineCircle: true, mineOrbit: 3, mineIdx: 0,
+  mine: false, mineMaxTiles: 70, helpTiles: 70, mineMatch: true, mineCircle: true, mineOrbit: 3, mineIdx: 0,
   // building
   rebuild: false, buildNav: true,
   // unit
   heal: false, healAt: 35, goCore: false, camFollow: false, speedIdx: 0, wantUnit: "", manualOverride: false,
   // anti grief
-  grief: true, griefPublic: false, griefRebuild: false, griefAll: false, griefLimit: 5, griefWindow: 8000,
+  grief: true, griefPublic: false, griefRebuild: false, griefAll: false, griefLevel: 1,
   // misc
-  markName: false, announce: true, barMin: false, tab: 0
+  markName: false, announce: true, barMin: false, monitor: false, coords: true, escortDist: 5, escortAngle: 150, tab: 0
 };
 
 var MARK = "\u200b\u200c\u200b";      // optional invisible name tag
 var PING = "\u200b\u200d\u200c\u200d";   // invisible chat ping that other Mobile Tools users recognise      // invisible tag added to your name so other Mobile Tools users can see you
 var SPEEDS = [1, 1.5, 2, 3];
 var HEAL_AT = [25, 35, 50, 70];
+var ESCORT = [4, 6, 8, 10];
+var MINE_DIST = [30, 45, 70, 120, 9999];
+var HELP_DIST = [30, 70, 120, 9999];
+var GRIEF_LEVELS = [[20, 10000, "Low"], [10, 10000, "Medium"], [5, 8000, "High"]];
 var MINE_ITEMS = ["copper", "lead", "sand", "coal", "titanium", "beryllium", "tungsten"];
 var MINE_CHOICES = ["auto"].concat(MINE_ITEMS);
 var WALL_ITEMS = {beryllium: true, tungsten: true};
@@ -32,11 +36,11 @@ var orbitAngle = 0, lastReset = 0, shootSrc = null, ourPlan = null;
 var matchTile = null, matchItem = null, matchTime = 0;
 var autoItem = null, curItem = null, curItemAt = 0, mineInfo = "", infoAt = 0;
 var fullSince = 0, lastTransfer = 0, blockedItem = null, blockedUntil = 0;
-var oreTile = null, oreItem = null, oreRetryAt = 0, oreCache = {}, lastScan = 0;
+var oreTile = null, oreItem = null, oreRetryAt = 0, oreCache = {}, nearCache = {}, lastScan = 0;
 var undoStack = [], griefLog = [], tally = {}, removed = [], flagged = {}, ignored = {};
 var lastSwitch = 0, lastRebuildToast = 0, speedBase = {}, speedType = null, speedAt = 0;
 var statusCache = "", statusAt = 0, powerBad = [], powerAt = 0;
-var modSeen = {}, lastPing = 0, pingDue = 0, detectAt = 0, infoCache = "", infoAt2 = 0, worldStart = Time.millis();
+var respawnPos = null, modSeen = {}, lastPing = 0, pingDue = 0, detectAt = 0, infoCache = "", infoAt2 = 0, worldStart = Time.millis();
 
 // Explicit wrappers: Mindustry's Rhino can't pick between overloads when given a bare function
 function mkCons(f){ return new Packages.arc.func.Cons({get: f}); }
@@ -122,87 +126,188 @@ function moveToward(u, x, y, stop){
   return false;
 }
 
+// set the unit's velocity directly (smooth, no overshoot) and face a sensible direction
+function driveVel(u, vx, vy, faceX, faceY){
+  var sp = u.speed();
+  var len = Math.sqrt(vx * vx + vy * vy);
+  if(len > sp){ vx = vx / len * sp; vy = vy / len * sp; len = sp; }
+  u.vel.set(vx, vy);
+  if(u.type.omniMovement) u.lookAt(faceX, faceY);
+  else if(len > 0.2) u.rotation = Mathf.angle(vx, vy);
+}
+
+// smooth circle around a point (works at any speed, no square corners)
 function orbit(u, t, rt){
   if(!u.type.flying){ moveToward(u, t.x, t.y, 60); return; }
   var r = (rt || S.orbit) * 8;
-  var step = Math.min(4, u.speed() * 0.8 / r * 57.3) * Time.delta;
-  orbitAngle = (orbitAngle + step) % 360;
-  Tmp.v2.trns(orbitAngle, r).add(t.x, t.y);
-  Tmp.v1.set(Tmp.v2).sub(u.x, u.y);
-  var d = Tmp.v1.len();
-  if(d > 0.5) Tmp.v1.setLength(Math.min(u.speed(), d * 0.5));
-  u.movePref(Tmp.v1);
-  u.lookAt(t.x, t.y);
+  var dx = u.x - t.x, dy = u.y - t.y;
+  var d = Math.sqrt(dx * dx + dy * dy);
+  if(d < 1){ dx = 1; dy = 0; d = 1; }
+  var sp = Math.min(u.speed() * 0.85, 6);
+  var rad = Mathf.clamp((r - d) * 0.25, -sp, sp);
+  var tvx = t.vel ? t.vel.x : 0, tvy = t.vel ? t.vel.y : 0;
+  driveVel(u, -dy / d * sp + dx / d * rad + tvx, dx / d * sp + dy / d * rad + tvy, t.x, t.y);
+}
+
+// hover beside a unit at a safe distance (so we never push them)
+function escort(u, t){
+  var r = S.escortDist * 8;
+  Tmp.v2.trns(S.escortAngle, r).add(t.x, t.y);
+  var tvx = t.vel ? t.vel.x : 0, tvy = t.vel ? t.vel.y : 0;
+  driveVel(u, (Tmp.v2.x - u.x) * 0.15 + tvx, (Tmp.v2.y - u.y) * 0.15 + tvy, t.x, t.y);
 }
 
 // ---------- help builders ----------
+// plans we copied from someone we were helping must not linger once the help is over
+function dropCopied(u){
+  if(assistCopied){
+    try{ u.plans.clear(); }catch(err){}
+    assistCopied = false;
+    assistHold = false;
+  }
+}
+
 function assistTick(u, core){
   if(!u.canBuild()) return false;
+  assistInfo = "";
   var p = null;
   if(S.targetId != -1){
     p = Groups.player.getByID(S.targetId);
     if(p == null){ S.targetId = -1; toast("Target left, helping anyone"); }
-    else if(!sameTeam(p)) return false; // only help players on your team
+    else if(!sameTeam(p)){ dropCopied(u); return false; } // only help players on your team
   }
   if(p == null){
-    var best = 1e9;
-    eachOf(Groups.player, q => {
-      if(q == Vars.player || q.dead() || !sameTeam(q)) return;
-      if(S.skipModUsers && isModUser(q)) return; // don't chase other Mobile Tools users
-      var qu = q.unit();
-      if(!qu.activelyBuilding()) return;
-      var d = u.dst(qu);
-      if(d < best){ best = d; p = q; }
-    });
+    // keep the previous builder while they keep building (stops flip-flopping between players)
+    if(lastTargetId != -1){
+      var lp = Groups.player.getByID(lastTargetId);
+      if(lp != null && !lp.dead() && sameTeam(lp) && !(S.skipModUsers && isModUser(lp)) &&
+         u.dst(lp.unit()) <= S.helpTiles * 12 && !(ignoreUntil[lp.id] > Time.millis()) &&
+         (lp.unit().activelyBuilding() || Time.millis() - lastBuildSeen < 4000)) p = lp;
+    }
+    if(p == null){
+      var best = 1e9;
+      eachOf(Groups.player, q => {
+        if(q == Vars.player || q.dead() || !sameTeam(q)) return;
+        if(S.skipModUsers && isModUser(q)) return; // don't chase other Mobile Tools users
+        if(ignoreUntil[q.id] > Time.millis()) return;
+        var qu = q.unit();
+        if(!qu.activelyBuilding()) return;
+        var d = u.dst(qu);
+        if(d < best && d <= S.helpTiles * 8){ best = d; p = q; }
+      });
+      if(p != null) lastTargetId = p.id;
+    }
   }
-  if(p == null || p.dead()) return false;
+  if(p == null || p.dead()){ assistHold = false; dropCopied(u); return false; }
 
   var tu = p.unit();
   shootSrc = tu;
 
-  // helped player is very far away: respawn at the closest core if that is much nearer to them
-  if(S.farReset && core != null && Time.millis() - lastReset > 15000){
+  // helped player is very far away: respawn at the core closest to THEM, if that is much nearer than I am
+  if(S.farReset && Time.millis() - lastReset > 15000){
     var dFar = Mathf.dst(u.x, u.y, tu.x, tu.y);
-    if(dFar > S.farTiles * 8 && Mathf.dst(core.x, core.y, tu.x, tu.y) < dFar - 160){
+    var tcore = Vars.state.teams.closestCore(tu.x, tu.y, Vars.player.team());
+    if(tcore != null && dFar > S.farTiles * 8 && Mathf.dst(tcore.x, tcore.y, tu.x, tu.y) < dFar - 160){
       lastReset = Time.millis();
-      toast("Resetting to core: " + dname(p) + " is far away");
+      // the game respawns you at the core nearest to where you are, so park the dead player next to them
+      respawnPos = {x: tu.x, y: tu.y, until: Time.millis() + 6000};
+      toast("Respawning at the core nearest " + dname(p));
       try{ Call.unitClear(Vars.player); }catch(err){ Vars.player.clearUnit(); }
+      Vars.player.set(tu.x, tu.y);
       return true;
     }
   }
 
-  var plan = tu.activelyBuilding() ? tu.buildPlan() : null;
+  var now2 = Time.millis();
+  var plan = (tu.activelyBuilding() && !(ignoreUntil[p.id] > now2)) ? tu.buildPlan() : null;
   if(plan != null){
+    lastBuildSeen = now2;
+    // if they sit on the same block for 20s they cannot finish it (no resources, blocked...): give up on them for a while
+    var key = plan.x + "," + plan.y + "," + (plan.block != null ? plan.block.id : -1);
+    if(key != stuckPlanKey){ stuckPlanKey = key; stuckSince = now2; }
+    else if(now2 - stuckSince > 20000){
+      ignoreUntil[p.id] = now2 + 30000;
+      stuckSince = now2; stuckPlanKey = "";
+      assistHold = false; lastTargetId = -1;
+      dropCopied(u);
+      return false;
+    }
+    assistInfo = "helping";
     var cur = u.buildPlan();
     if(cur == null || cur.x != plan.x || cur.y != plan.y || cur.block != plan.block || cur.breaking != plan.breaking){
       u.plans.clear();
       u.plans.addFirst(plan.copy());
+      assistCopied = true;
     }
     u.updateBuilding = true;
     var px = plan.drawx(), py = plan.drawy();
-    if(S.circle && Mathf.dst(tu.x, tu.y, px, py) < Vars.buildingRange - 30 - S.orbit * 8) orbit(u, tu);
-    else if(!u.within(px, py, Vars.buildingRange - 30)) moveToward(u, px, py, Vars.buildingRange - 60);
+    var br = (u.type.buildRange > 0 ? u.type.buildRange : Vars.buildingRange) - 50;
+    var reach = br - (S.circle ? S.orbit : S.escortDist) * 8;
+    if(Mathf.dst(tu.x, tu.y, px, py) < reach){
+      assistHold = false;
+      if(S.circle) orbit(u, tu); else escort(u, tu);
+      return true;
+    }
+    // fly into build range once, then stop dead (only move again if they get well out of range)
+    var dp = Mathf.dst(u.x, u.y, px, py);
+    if(assistHold){ if(dp > br + 40) assistHold = false; }
+    else if(dp < br) assistHold = true;
+    if(assistHold){ u.vel.setZero(); return true; }
+    moveToward(u, px, py, br - 30);
     return true;
   }
+  assistHold = false;
 
   if(S.targetId != -1){
-    if(S.mine && S.mineMatch && tu.mineTile != null) return false; // let auto mine join them
-    if(S.circle) orbit(u, tu); else moveToward(u, tu.x, tu.y, 60);
+    if(S.mine && S.mineMatch && tu.mineTile != null){ dropCopied(u); return false; } // let auto mine join them
+    if(S.circle) orbit(u, tu); else escort(u, tu);
     return true;
   }
+  // helping anyone: stay put for a few seconds when they pause, instead of rushing off to mine
+  if(now2 - lastBuildSeen < 2500){ assistInfo = "waiting"; u.vel.setZero(); return true; }
+  dropCopied(u);
   return false;
 }
 
 // ---------- build planner: fly to what you queued ----------
+var planHold = false, assistHold = false, assistCopied = false, lastBuildSeen = 0, lastTargetId = -1;
+var plannerSkipUntil = 0, planKey = "", planSince = 0, stuckPlanKey = "", stuckSince = 0, ignoreUntil = {}, assistInfo = "";
+
 function plannerTick(u){
   if(!u.canBuild()) return false;
-  var plan = u.buildPlan();
-  if(plan == null) return false;
-  if(ourPlan != null && plan.x == ourPlan.x && plan.y == ourPlan.y) return false; // rebuild handles its own
+  if(assistCopied) return false; // that plan belongs to the person we were helping
+  if(Time.millis() < plannerSkipUntil) return false;
+  if(u.plans.size == 0){ planHold = false; return false; }
+  var first = u.buildPlan();
+  if(ourPlan != null && first != null && first.x == ourPlan.x && first.y == ourPlan.y) return false; // rebuild handles its own
   if(manualInput()) return false; // you are steering
   u.updateBuilding = true;
-  var px = plan.drawx(), py = plan.drawy();
-  if(!u.within(px, py, Vars.buildingRange - 40)) moveToward(u, px, py, Vars.buildingRange - 70);
+  // The game keeps shuffling the queue, so look at all queued plans, not just the first.
+  var br = (u.type.buildRange > 0 ? u.type.buildRange : Vars.buildingRange) - 50;
+  var n = Math.min(u.plans.size, 60);
+  var near = null, nd = 1e9;
+  for(var i = 0; i < n; i++){
+    var pl = u.plans.get(i);
+    var d = Mathf.dst(u.x, u.y, pl.drawx(), pl.drawy());
+    if(d < nd){ nd = d; near = pl; }
+  }
+  // Once something is in build range: stop dead and stay put. Only start moving again
+  // when nothing is within range any more (the extra 40 stops it flip-flopping at the edge).
+  if(planHold){ if(nd > br + 40) planHold = false; }
+  else if(nd < br) planHold = true;
+  var pk = u.plans.size + ":" + near.x + "," + near.y;
+  if(pk != planKey){ planKey = pk; planSince = Time.millis(); }
+  else if(planHold && Time.millis() - planSince > 15000){
+    // nothing has changed for 15s: the plan cannot be finished, so stop waiting for it
+    plannerSkipUntil = Time.millis() + 20000;
+    planHold = false; planKey = "";
+    return false;
+  }
+  if(planHold){
+    u.vel.setZero();
+    return true;
+  }
+  moveToward(u, near.drawx(), near.drawy(), br - 30);
   return true;
 }
 
@@ -339,6 +444,21 @@ function hasOreFor(u, item){
   return v;
 }
 
+// is there ore of this kind within the allowed distance of the core?
+function oreNear(u, item, core){
+  var key = u.type.name + ":" + item.name;
+  var now = Time.millis();
+  var c = nearCache[key];
+  if(c != null && now - c.t < 4000) return c.v;
+  var v = false;
+  try{
+    var t = findOre(u, item, core.x, core.y, true);
+    if(t != null && Mathf.dst(core.x, core.y, t.worldx(), t.worldy()) <= S.mineMaxTiles * 8) v = true;
+  }catch(err){}
+  nearCache[key] = {t: now, v: v};
+  return v;
+}
+
 function chooseItem(u, core){
   if(S.mineMatch){
     var mu = minerToCopy(u);
@@ -354,7 +474,7 @@ function chooseItem(u, core){
   if(want == "auto"){
     // keep mining what we are already carrying / already chose
     if(u.stack.amount > 0 && u.stack.item != null && u.canMine(u.stack.item) && !isBlocked(u.stack.item)){ autoItem = u.stack.item; return autoItem; }
-    if(autoItem != null && u.canMine(autoItem) && hasOreFor(u, autoItem) && !isBlocked(autoItem)) return autoItem;
+    if(autoItem != null && u.canMine(autoItem) && oreNear(u, autoItem, core) && !isBlocked(autoItem) && core.items.get(autoItem) < core.storageCapacity * 0.97) return autoItem;
   }else{
     var it = Vars.content.item(want);
     if(it != null && u.canMine(it)) return it;
@@ -364,11 +484,11 @@ function chooseItem(u, core){
   var best = null, amt = 1e9;
   for(var n = 0; n < MINE_ITEMS.length; n++){
     var i = Vars.content.item(MINE_ITEMS[n]);
-    if(i == null || !u.canMine(i) || !hasOreFor(u, i) || isBlocked(i)) continue;
+    if(i == null || !u.canMine(i) || !oreNear(u, i, core) || isBlocked(i) || core.items.get(i) >= core.storageCapacity * 0.97) continue;
     var a = core.items.get(i);
     if(a < amt){ amt = a; best = i; }
   }
-  if(best == null) mineInfo = "nothing minable here for this unit";
+  if(best == null) mineInfo = "nothing to mine: no ore within " + S.mineMaxTiles + " tiles of the core, or the core is full";
   autoItem = best;
   return best;
 }
@@ -437,12 +557,13 @@ function mineTick(u, core){
   }else if(oreTile == null || oreItem != item || !oreOk(oreTile, item)){
     oreTile = null;
     if(now >= oreRetryAt){
-      oreTile = findOre(u, item, direct ? core.x : u.x, direct ? core.y : u.y, direct);
+      oreTile = findOre(u, item, core.x, core.y, true);
+      if(oreTile != null && Mathf.dst(core.x, core.y, oreTile.worldx(), oreTile.worldy()) > S.mineMaxTiles * 8) oreTile = null;
       oreItem = item;
       if(oreTile == null) oreRetryAt = now + 1500;
     }
   }
-  if(oreTile == null){ if(upd) mineInfo = item.name + " no ore found"; return false; }
+  if(oreTile == null){ if(upd) mineInfo = item.name + " no ore within " + S.mineMaxTiles + " tiles of the core"; return false; }
   var ox = oreTile.worldx(), oy = oreTile.worldy();
   var range = u.type.mineRange;
 
@@ -521,17 +642,44 @@ function detectTick(){
   }
 }
 
+// ---------- tap the map to see its coordinates ----------
+var tapDown = false, tapSX = 0, tapSY = 0, tapT = 0, coordMark = null;
+function coordTick(){
+  if(!S.coords){ tapDown = false; return; }
+  if(Core.input.justTouched()){
+    var onUi = false;
+    try{ onUi = Core.scene.hasMouse(); }catch(err){}
+    tapDown = !onUi;
+    tapSX = Core.input.mouseX(); tapSY = Core.input.mouseY(); tapT = Time.millis();
+  }
+  if(tapDown && !Core.input.isTouched()){
+    tapDown = false;
+    if(Time.millis() - tapT < 500 && Math.abs(Core.input.mouseX() - tapSX) + Math.abs(Core.input.mouseY() - tapSY) < 20){
+      var w = Core.input.mouseWorld(tapSX, tapSY);
+      var tx = Math.round(w.x / 8), ty = Math.round(w.y / 8);
+      var what = "";
+      try{
+        var t = Vars.world.tile(tx, ty);
+        if(t != null) what = "  [lightgray]" + (t.block() != Blocks.air ? t.block().localizedName : t.floor().localizedName);
+      }catch(err){}
+      Vars.ui.showInfoToast("[accent]" + tx + ", " + ty + what, 2.5);
+      coordMark = {x: tx * 8, y: ty * 8, until: Time.millis() + 2500};
+    }
+  }
+}
+
 // ---------- brain ----------
 function runBrain(u, core){
+  if(!S.assist && assistCopied) dropCopied(u);
   if(S.goCore){
     if(core == null){ S.goCore = false; return false; }
     if(moveToward(u, core.x, core.y, 40)) S.goCore = false;
     return true;
   }
-  if(S.heal && healTick(u, core)) return true;
-  if(S.assist && assistTick(u, core)) return true;
-  if(S.rebuild && rebuildTick(u)) return true;
-  if(S.buildNav && plannerTick(u)) return true;
+  if(S.heal && healTick(u, core)){ u.mineTile = null; mineInfo = ""; return true; }
+  if(S.assist && assistTick(u, core)){ u.mineTile = null; mineInfo = ""; return true; }
+  if(S.rebuild && rebuildTick(u)){ u.mineTile = null; mineInfo = ""; return true; }
+  if(S.buildNav && plannerTick(u)){ u.mineTile = null; mineInfo = ""; return true; }
   if(S.mine) return mineTick(u, core);
   return false;
 }
@@ -539,7 +687,14 @@ function runBrain(u, core){
 Events.run(EventType.Trigger.update, () => {
   holdOn = false;
   holdMineOn = false;
-  if(Vars.state.isGame()){ try{ detectTick(); }catch(err){} }
+  if(Vars.state.isGame()){
+    try{ detectTick(); }catch(err){}
+    try{ coordTick(); }catch(err){}
+    if(respawnPos != null){
+      if(Time.millis() > respawnPos.until) respawnPos = null;
+      else if(Vars.player.dead()) Vars.player.set(respawnPos.x, respawnPos.y);
+    }
+  }
   if(!alive()) return;
   try{
     var now = Time.millis();
@@ -566,7 +721,11 @@ Events.run(EventType.Trigger.draw, () => {
   try{
     // while automation is in charge, undo movement/mining resets the normal controls added
     if(holdOn && alive() && me() == holdUnit) holdUnit.vel.set(holdV);
-    if(holdMineOn && alive() && me() == holdUnit) holdUnit.mineTile = holdMine;
+    if(holdMineOn && alive() && me() == holdUnit){
+      var hm = holdMine;
+      if(hm != null && !holdUnit.within(hm.worldx(), hm.worldy(), holdUnit.type.mineRange + 8)) hm = null;
+      holdUnit.mineTile = hm;
+    }
     // copy the helped player's shooting and aim
     if(S.copyShoot && shootSrc != null && alive() && shootSrc.isShooting){
       var mu = me();
@@ -578,6 +737,19 @@ Events.run(EventType.Trigger.draw, () => {
     }
   }catch(err){}
   holdOn = false; holdMineOn = false; shootSrc = null;
+
+  try{
+    if(coordMark != null){
+      if(Time.millis() > coordMark.until) coordMark = null;
+      else{
+        Draw.z(Layer.overlayUI);
+        Lines.stroke(1.5);
+        Draw.color(Color.white, 0.9);
+        Lines.circle(coordMark.x, coordMark.y, 6);
+        Draw.reset();
+      }
+    }
+  }catch(err){ coordMark = null; }
 
   if(!Vars.state.isGame()) return;
   if(!(S.turretRanges || S.enemyRanges || S.unitRanges || S.power)) return;
@@ -660,11 +832,12 @@ Events.on(EventType.BlockBuildEndEvent, e => {
     var now = Time.millis();
     if(S.grief){
       var rec = tally[p.id];
-      if(rec == null || now - rec.t0 > S.griefWindow){ rec = {t0: now, n: 0}; tally[p.id] = rec; }
+      var gl = GRIEF_LEVELS[S.griefLevel];
+      if(rec == null || now - rec.t0 > gl[1]){ rec = {t0: now, n: 0}; tally[p.id] = rec; }
       rec.n++;
-      if(rec.n >= S.griefLimit && !flagged[p.id]){
+      if(rec.n >= gl[0] && !flagged[p.id]){
         flagged[p.id] = dname(p); // stays watched for the rest of the session
-        var msg = dname(p) + " deconstructed " + rec.n + " blocks in " + (S.griefWindow / 1000) + "s, near " + e.tile.x + "," + e.tile.y;
+        var msg = dname(p) + " deconstructed " + rec.n + " blocks in " + (gl[1] / 1000) + "s, near " + e.tile.x + "," + e.tile.y;
         griefLog.unshift(msg);
         if(griefLog.length > 12) griefLog.pop();
         chatAlert(msg);
@@ -690,8 +863,8 @@ Events.on(EventType.PlayerJoin, e => {
 });
 Events.on(EventType.PlayerLeave, e => { toast(dname(e.player) + " left"); });
 Events.on(EventType.WorldLoadEvent, e => {
-  healing = false; oreTile = null; matchTile = null; autoItem = null; curItemAt = 0; oreCache = {}; ourPlan = null;
-  undoStack = []; tally = {}; removed = []; flagged = {}; modSeen = {};
+  healing = false; assistCopied = false; oreTile = null; matchTile = null; autoItem = null; curItemAt = 0; oreCache = {}; nearCache = {}; ourPlan = null;
+  undoStack = []; tally = {}; removed = []; flagged = {}; modSeen = {}; ignoreUntil = {};
   worldStart = Time.millis();
   if(S.announce) pingDue = Time.millis() + 6000;
   S.goCore = false;
@@ -736,7 +909,9 @@ function statusText(){
   if(healing) s.push("healing:" + healInfo);
   if(S.assist){
     var p = S.targetId == -1 ? null : Groups.player.getByID(S.targetId);
-    s.push("help:" + (p == null ? "anyone" : dname(p) + (!sameTeam(p) ? " (other team, not helping)" : "")));
+    var hn = "";
+    if(assistInfo == "helping" && lastTargetId != -1){ var hp = Groups.player.getByID(lastTargetId); if(hp != null) hn = " " + dname(hp); }
+    s.push("help:" + (p == null ? "anyone" : dname(p) + (!sameTeam(p) ? " (other team, not helping)" : "")) + (assistInfo != "" ? " [" + assistInfo + (p == null ? hn : "") + "]" : ""));
   }
   if(S.rebuild) s.push("rebuild" + (alive() ? "(" + me().team.data().plans.size + ")" : ""));
   if(S.wantUnit != "") s.push("unit:" + S.wantUnit);
@@ -760,6 +935,12 @@ Log.info("Mobile Tools: script loaded");
 S.markName = Core.settings.getBool("mt-mark", false);
 S.announce = Core.settings.getBool("mt-announce", true);
 S.barMin = Core.settings.getBool("mt-min", false);
+S.coords = Core.settings.getBool("mt-coords", true);
+S.monitor = Core.settings.getBool("mt-mon", false);
+try{
+  S.griefLevel = parseInt(String(Core.settings.getString("mt-gl", "1")));
+  if(!(S.griefLevel >= 0 && S.griefLevel <= 2)) S.griefLevel = 1;
+}catch(err){ S.griefLevel = 1; }
 try{
   var mk = String(Core.settings.getString("mt-marked", "")).split("\n");
   for(var mi = 0; mi < mk.length; mi++) if(mk[mi].length > 0) ignored[mk[mi]] = true;
@@ -780,7 +961,7 @@ Events.on(EventType.ClientLoadEvent, e => {
 
   var TOGST = null;
   try{ TOGST = Styles.togglet; }catch(err){}
-  var dragging = false, moved = false, offX = 0, offY = 0, downX = 0, downY = 0;
+  var barDrag = {moved: false}, monDrag = {moved: false};
   var holder = new Packages.arc.scene.ui.layout.Table();
 
   function section(p, name, note){
@@ -794,21 +975,27 @@ Events.on(EventType.ClientLoadEvent, e => {
   try{ TOGI = Styles.clearTogglei; }catch(err){}
   try{ CLEARI = Styles.cleari; }catch(err){}
   try{ BARBG = Styles.black6; }catch(err){}
-  function ic(name){ try{ var d = Icon[name]; return d == null ? null : d; }catch(err){ return null; } }
+  function ic(name){
+    var names = (name instanceof Array) ? name : [name];
+    for(var i = 0; i < names.length; i++){
+      try{ var d = Icon[names[i]]; if(d != null) return d; }catch(err){}
+    }
+    return null;
+  }
 
   // small icon toggle for the quick bar (falls back to a text button if the icon is missing)
   function barToggle(t, iconName, label, key){
-    var run = mkRun(() => { if(!moved) S[key] = !S[key]; });
+    var run = mkRun(() => { if(!barDrag.moved) S[key] = !S[key]; });
     var d = ic(iconName);
     var c;
     if(d != null && TOGI != null){ c = t.button(d, TOGI, run); c.size(38, 38).pad(1); }
-    else if(TOGST != null){ c = t.button(label, TOGST, run); c.size(58, 38).pad(1); }
+    else if(TOGST != null){ c = t.button(label, TOGST, run); c.size(58, 38).pad(1); try{ c.get().getLabel().setFontScale(0.7); }catch(err){} }
     else { c = t.button(label, run); c.size(58, 38).pad(1); }
     try{ var b = c.get(); b.update(mkRun(() => { b.setChecked(S[key]); })); }catch(err){}
     return c;
   }
   function barButton(t, iconName, label, fn){
-    var run = mkRun(() => { if(!moved) fn(); });
+    var run = mkRun(() => { if(!barDrag.moved) fn(); });
     var d = iconName == null ? null : ic(iconName);
     var c;
     if(d != null && CLEARI != null){ c = t.button(d, CLEARI, run); c.size(38, 38).pad(1); }
@@ -819,6 +1006,7 @@ Events.on(EventType.ClientLoadEvent, e => {
 
   function buildBar(){
     holder.clear();
+    monL = null; monR = null; monP = null; monAt = 0;
     try{ if(BARBG != null) holder.background(BARBG); }catch(err){}
     if(S.barMin){
       barButton(holder, null, "+", () => { S.barMin = false; Core.settings.put("mt-min", false); Core.app.post(mkRun(() => buildBar())); });
@@ -827,16 +1015,135 @@ Events.on(EventType.ClientLoadEvent, e => {
       barButton(holder, "menu", "MT", () => { refresh(); menu.show(); });
       barToggle(holder, "players", "Help", "assist");
       barToggle(holder, "pick", "Mine", "mine");
-      barToggle(holder, "tools", "Plan", "buildNav");
+      barToggle(holder, ["wrench", "hammer", "tools", "pencil"], "Plan", "buildNav");
       barToggle(holder, "refresh", "Rebuild", "rebuild");
       barToggle(holder, "add", "Heal", "heal");
       barToggle(holder, "eye", "Me", "camFollow");
+      barToggle(holder, "chartBar", "Stats", "monitor");
       barButton(holder, "cancel", "Stop", () => { S.assist = false; S.mine = false; S.rebuild = false; S.goCore = false; S.heal = false; });
       barButton(holder, null, "-", () => { S.barMin = true; Core.settings.put("mt-min", true); Core.app.post(mkRun(() => buildBar())); });
       holder.row();
-      smallLabel(holder.label(mkProv(() => statusText())).colspan(9).left().width(340).wrap());
+      smallLabel(holder.label(mkProv(() => statusText())).colspan(10).left().width(340).wrap());
       holder.row();
-      smallLabel(holder.label(mkProv(() => infoText())).colspan(9).left());
+      smallLabel(holder.label(mkProv(() => infoText())).colspan(10).left());
+      if(S.monitor){
+        holder.row();
+        monL = holder.add("[lightgray]loading...").colspan(5).left().top().padTop(4).get();
+        monR = holder.add("").colspan(5).left().top().padTop(4).get();
+        holder.row();
+        monP = holder.add("").colspan(10).left().padTop(4).get();
+        try{ monL.setFontScale(0.8); monR.setFontScale(0.8); monP.setFontScale(0.8); }catch(err){}
+      }
+    }
+    holder.pack();
+  }
+
+  function makeDrag(tbl, key, defX, defY){
+    var st = {dragging: false, moved: false};
+    var offX = 0, offY = 0, downX = 0, downY = 0;
+    var px = defX, py = defY;
+    var saved = String(Core.settings.getString(key, ""));
+    if(saved.indexOf(",") > 0){
+      var parts = saved.split(",");
+      px = parseFloat(parts[0]); py = parseFloat(parts[1]);
+    }
+    if(isNaN(px) || isNaN(py)){ px = defX; py = defY; }
+    tbl.setPosition(px, py);
+    st.tick = function(){
+      var mx = Core.input.mouseX(), my = Core.input.mouseY();
+      if(Core.input.isTouched()){
+        if(!st.dragging && Core.input.justTouched() && tbl.visible && mx >= tbl.x && mx <= tbl.x + tbl.getWidth() && my >= tbl.y && my <= tbl.y + tbl.getHeight()){
+          st.dragging = true; st.moved = false; offX = mx - tbl.x; offY = my - tbl.y; downX = mx; downY = my;
+        }
+        if(st.dragging){
+          if(Math.abs(mx - downX) + Math.abs(my - downY) > 20) st.moved = true;
+          if(st.moved) tbl.setPosition(mx - offX, my - offY);
+        }
+      }else if(st.dragging){
+        st.dragging = false;
+        Core.settings.put(key, tbl.x + "," + tbl.y);
+      }
+      // keep it on screen, even after a rotation or resize
+      var W = Core.graphics.getWidth(), H = Core.graphics.getHeight();
+      var cx = Mathf.clamp(tbl.x, 0, Math.max(0, W - tbl.getWidth()));
+      var cy = Mathf.clamp(tbl.y, 0, Math.max(0, H - tbl.getHeight()));
+      if(cx != tbl.x || cy != tbl.y) tbl.setPosition(cx, cy);
+    };
+    return st;
+  }
+
+  function resetBar(){
+    S.barMin = false;
+    Core.settings.put("mt-min", false);
+    holder.setPosition(8, Core.graphics.getHeight() * 0.5);
+    Core.settings.put("mt-pos", holder.x + "," + holder.y);
+    buildBar();
+    toast("Quick bar restored");
+  }
+  // ----- resource monitor: items, rates, core full, power -----
+  var rateRef = {}, monAt = 0;
+  function fmt(n){ n = Math.floor(n); return n >= 10000 ? (n / 1000).toFixed(1) + "k" : String(n); }
+
+  function powerLine(){
+    var team = Vars.player.team();
+    var seen = {}, stored = 0, cap = 0, prod = 0, need = 0, any = false;
+    function addG(b){
+      try{
+        if(b.power == null || b.power.graph == null) return;
+        var g = b.power.graph;
+        var key = String(g.hashCode());
+        if(seen[key]) return;
+        seen[key] = true;
+        any = true;
+        stored += g.getBatteryStored();
+        cap += g.getTotalBatteryCapacity();
+        prod += g.getLastPowerProduced() * 60;
+        need += g.getLastPowerNeeded() * 60;
+      }catch(err){}
+    }
+    try{ eachOf(Vars.indexer.getFlagged(team, BlockFlag.battery), addG); }catch(err){}
+    try{ eachOf(Vars.indexer.getFlagged(team, BlockFlag.generator), addG); }catch(err){}
+    if(!any) return "[lightgray]Power: none";
+    var net = prod - need;
+    return "Power " + (net >= 0 ? "[green]+" : "[scarlet]") + fmt(net) + "[lightgray]/s[]  made " + fmt(prod) + "  used " + fmt(need) +
+           (cap > 0 ? "\nBattery " + fmt(stored) + "/" + fmt(cap) + " [lightgray](" + Math.round(stored / cap * 100) + "%)[]" : "");
+  }
+
+  // current numbers for the monitor (used by the floating panel and by the Stats tab)
+  function monData(){
+    var core = null;
+    try{ core = Vars.player.closestCore(); }catch(err){}
+    if(core == null) return {l: "[lightgray]No core", r: "", p: powerLine()};
+    var now = Time.millis(), cap = core.storageCapacity;
+    var lines = [];
+    eachOf(Vars.content.items(), it => {
+      var amt = core.items.get(it);
+      var ref = rateRef[it.id];
+      if(ref == null){ ref = {amt: amt, t: now, rate: 0}; rateRef[it.id] = ref; }
+      else if(now - ref.t >= 3000){ ref.rate = (amt - ref.amt) / ((now - ref.t) / 1000); ref.amt = amt; ref.t = now; }
+      if(amt <= 0 && Math.abs(ref.rate) < 0.05) return;
+      var ico = "";
+      try{ ico = String(it.emoji()); }catch(err){}
+      if(ico.length == 0) ico = String(it.name).substring(0, 3);
+      var r = ref.rate;
+      lines.push(ico + " " + fmt(amt) + (amt >= cap ? " [scarlet]FULL[]" : "") + " " + (r >= 0 ? "[green]+" : "[scarlet]") + r.toFixed(1) + "[lightgray]/s[]");
+    });
+    var half = Math.ceil(lines.length / 2);
+    return {l: lines.slice(0, half).join("\n"), r: lines.slice(half).join("\n"), p: powerLine()};
+  }
+
+  var monL = null, monR = null, monP = null;
+  function updateMon(){
+    if(monL == null) return;
+    var now = Time.millis();
+    if(now - monAt < 1000) return;
+    monAt = now;
+    try{
+      var d = monData();
+      monL.setText(String(d.l)); monR.setText(String(d.r)); monP.setText(String(d.p));
+    }catch(err){
+      Log.err(err);
+      monL.setText("[scarlet]Monitor error: " + err);
     }
     holder.pack();
   }
@@ -892,9 +1199,14 @@ Events.on(EventType.ClientLoadEvent, e => {
     toggle(p, "Help builders", "assist");
     var tp = S.targetId == -1 ? null : Groups.player.getByID(S.targetId);
     btn(p, "Helping: " + (tp == null ? "anyone who is building" : dname(tp)) + " (tap to change)", openPicker);
+    btn(p, "Only help builders within " + (S.helpTiles >= 9999 ? "any distance" : S.helpTiles + " tiles") + " of me (tap to change)", () => {
+      S.helpTiles = HELP_DIST[(HELP_DIST.indexOf(S.helpTiles) + 1) % HELP_DIST.length];
+      refresh();
+    });
     toggle(p, "Circle around the player", "circle");
+    btn(p, "Not circling: stay " + S.escortDist + " tiles beside them (tap to change)", () => { S.escortDist = ESCORT[(ESCORT.indexOf(S.escortDist) + 1) % ESCORT.length]; refresh(); });
     toggle(p, "Shoot where they shoot", "copyShoot");
-    toggle(p, "Respawn at core if the player is very far", "farReset");
+    toggle(p, "Respawn at the core nearest them if they are very far", "farReset");
     toggle(p, "Don't help other Mobile Tools users (when helping anyone)", "skipModUsers");
   }
 
@@ -904,6 +1216,11 @@ Events.on(EventType.ClientLoadEvent, e => {
     toggle(p, "Mine what the helped player mines", "mineMatch");
     toggle(p, "Circle around the ore while mining", "mineCircle");
     btn(p, "Mine item: " + MINE_CHOICES[S.mineIdx] + " (tap to change)", () => { S.mineIdx = (S.mineIdx + 1) % MINE_CHOICES.length; autoItem = null; curItemAt = 0; refresh(); });
+    btn(p, "Only mine within " + (S.mineMaxTiles >= 9999 ? "any distance" : S.mineMaxTiles + " tiles") + " of the core (tap to change)", () => {
+      S.mineMaxTiles = MINE_DIST[(MINE_DIST.indexOf(S.mineMaxTiles) + 1) % MINE_DIST.length];
+      nearCache = {}; oreTile = null; oreRetryAt = 0; curItemAt = 0;
+      refresh();
+    });
     btn(p, "What can my unit mine here?", () => { Vars.ui.showInfoToast("This unit can mine: " + minableNow(), 5); });
   }
 
@@ -931,12 +1248,30 @@ Events.on(EventType.ClientLoadEvent, e => {
     btn(p, "Fly to closest core", () => { S.goCore = true; });
     btn(p, "Respawn", () => { try{ Call.unitClear(Vars.player); }catch(err){ Vars.player.clearUnit(); } });
     toggle(p, "Let me take over (pause automation while I touch)", "manualOverride");
-    btn(p, "Reset quick bar position", () => { holder.setPosition(8, Core.graphics.getHeight() * 0.5); Core.settings.put("mt-pos", holder.x + "," + holder.y); });
+    btn(p, "Show / reset the quick bar", resetBar);
+  }
+
+  function tabStats(p){
+    section(p, "Core items", "Net change per second over the last few seconds. FULL means the core is at capacity.");
+    var d = monData();
+    p.table(mkCons(t => {
+      t.add(String(d.l)).left().top().padRight(24);
+      t.add(String(d.r)).left().top();
+    })).left().row();
+    p.add(String(d.p)).left().padTop(8).row();
+    btn(p, "Refresh", refresh);
+    p.check("Also show it under the quick bar", S.monitor, mkBoolc(v => { S.monitor = v; Core.settings.put("mt-mon", v); })).left().row();
   }
 
   function tabGuard(p){
     section(p, "Anti grief", "Warns you in chat and can rebuild what other players remove.");
     toggle(p, "Warn on mass deconstruction (in chat)", "grief");
+    var gl = GRIEF_LEVELS[S.griefLevel];
+    btn(p, "Sensitivity: " + gl[2] + " (" + gl[0] + " blocks in " + (gl[1] / 1000) + "s) - tap to change", () => {
+      S.griefLevel = (S.griefLevel + 1) % GRIEF_LEVELS.length;
+      Core.settings.put("mt-gl", String(S.griefLevel));
+      refresh();
+    });
     toggle(p, "Also post warnings in public chat", "griefPublic");
     toggle(p, "Auto-rebuild what watched players remove", "griefRebuild");
     toggle(p, "...and rebuild what ANY other player removes", "griefAll");
@@ -975,6 +1310,9 @@ Events.on(EventType.ClientLoadEvent, e => {
     toggle(p, "Enemy turret ranges", "enemyRanges");
     toggle(p, "Enemy unit ranges", "unitRanges");
     toggle(p, "Mark underpowered blocks", "power");
+    section(p, "Monitors", "Shown under the quick bar (drag the bar to move it): every item in your core, how fast it changes, FULL warnings and power/battery.");
+    p.check("Resource monitor (under the quick bar)", S.monitor, mkBoolc(v => { S.monitor = v; Core.settings.put("mt-mon", v); })).left().row();
+    p.check("Show coordinates when I tap the map", S.coords, mkBoolc(v => { S.coords = v; Core.settings.put("mt-coords", v); })).left().row();
   }
 
   function tabUsers(p){
@@ -999,7 +1337,7 @@ Events.on(EventType.ClientLoadEvent, e => {
     p.check("Also tag my name (applies when you rejoin)", S.markName, mkBoolc(v => { S.markName = v; Core.settings.put("mt-mark", v); applyNameMark(); })).left().wrap().growX().row();
   }
 
-  var TABS = [["Help", tabHelp], ["Mine", tabMine], ["Build", tabBuild], ["Unit", tabUnit], ["Guard", tabGuard], ["View", tabView], ["Users", tabUsers]];
+  var TABS = [["Help", tabHelp], ["Mine", tabMine], ["Build", tabBuild], ["Unit", tabUnit], ["Guard", tabGuard], ["View", tabView], ["Stats", tabStats], ["Users", tabUsers]];
 
   function refresh(){
     menu.cont.clear();
@@ -1015,38 +1353,29 @@ Events.on(EventType.ClientLoadEvent, e => {
 
   menu.shown(mkRun(() => refresh()));
 
+  // entry in the game's own Settings screen (also a way to bring the quick bar back)
+  try{
+    var cat = mkCons(st => {
+      st.button("Open Mobile Tools menu", mkRun(() => { try{ Vars.ui.settings.hide(); }catch(err){} refresh(); menu.show(); })).growX().height(50).pad(4).row();
+      st.button("Show / reset the quick bar", mkRun(() => { resetBar(); })).growX().height(50).pad(4).row();
+      st.button("Turn on the resource monitor", mkRun(() => { S.monitor = true; Core.settings.put("mt-mon", true); })).growX().height(50).pad(4).row();
+    });
+    var sIcon = ic("settings");
+    if(sIcon != null) Vars.ui.settings.addCategory("Mobile Tools", sIcon, cat);
+    else Vars.ui.settings.addCategory("Mobile Tools", cat);
+  }catch(err){ Log.err(err); }
+
   // ----- quick bar on the HUD (drag it anywhere) -----
   buildBar();
 
-  var px = 8, py = Core.graphics.getHeight() * 0.5;
-  var saved = String(Core.settings.getString("mt-pos", ""));
-  if(saved.indexOf(",") > 0){
-    var parts = saved.split(",");
-    px = parseFloat(parts[0]); py = parseFloat(parts[1]);
-  }
-  holder.setPosition(px, py);
-
-  var lastPacked = "";
+  barDrag = makeDrag(holder, "mt-pos", 8, Core.graphics.getHeight() * 0.5);
+  var lastPacked = "", lastMon = S.monitor;
   holder.update(mkRun(() => {
     holder.visible = Vars.state.isGame() && Vars.ui.hudfrag.shown;
+    if(S.monitor != lastMon){ lastMon = S.monitor; Core.app.post(mkRun(() => buildBar())); }
+    if(S.monitor && holder.visible) updateMon();
     if(statusCache != lastPacked){ lastPacked = statusCache; holder.pack(); }
-    var mx = Core.input.mouseX(), my = Core.input.mouseY();
-    if(Core.input.isTouched()){
-      if(!dragging && Core.input.justTouched() && holder.visible && mx >= holder.x && mx <= holder.x + holder.getWidth() && my >= holder.y && my <= holder.y + holder.getHeight()){
-        dragging = true; moved = false; offX = mx - holder.x; offY = my - holder.y; downX = mx; downY = my;
-      }
-      if(dragging){
-        if(Math.abs(mx - downX) + Math.abs(my - downY) > 20) moved = true;
-        if(moved){
-          holder.setPosition(
-            Mathf.clamp(mx - offX, 0, Core.graphics.getWidth() - holder.getWidth()),
-            Mathf.clamp(my - offY, 0, Core.graphics.getHeight() - holder.getHeight()));
-        }
-      }
-    }else if(dragging){
-      dragging = false;
-      Core.settings.put("mt-pos", holder.x + "," + holder.y);
-    }
+    barDrag.tick();
   }));
   Vars.ui.hudGroup.addChild(holder);
   Log.info("Mobile Tools: menu ready");
