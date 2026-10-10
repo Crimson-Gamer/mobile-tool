@@ -39,6 +39,7 @@ var fullSince = 0, lastTransfer = 0, blockedItem = null, blockedUntil = 0;
 var oreTile = null, oreItem = null, oreRetryAt = 0, oreCache = {}, nearCache = {}, lastScan = 0;
 var undoStack = [], griefLog = [], tally = {}, removed = [], flagged = {}, ignored = {};
 var lastSwitch = 0, lastRebuildToast = 0, speedBase = {}, speedType = null, speedAt = 0;
+var barRef = null, ensureAt = 0;
 var statusCache = "", statusAt = 0, powerBad = [], powerAt = 0;
 var respawnPos = null, modSeen = {}, lastPing = 0, pingDue = 0, detectAt = 0, infoCache = "", infoAt2 = 0, worldStart = Time.millis();
 
@@ -642,6 +643,19 @@ function detectTick(){
   }
 }
 
+// ---------- keep the quick bar on screen ----------
+// Some servers/mods rebuild the HUD, which silently drops our bar. Re-attach it if that happens.
+function ensureBar(){
+  var now = Time.millis();
+  if(now - ensureAt < 1000 || barRef == null) return;
+  ensureAt = now;
+  try{
+    var g = Vars.ui.hudGroup;
+    if(barRef.parent != g) g.addChild(barRef);
+    else if(barRef.getZIndex() < g.getChildren().size - 1) barRef.toFront();
+  }catch(err){}
+}
+
 // ---------- tap the map to see its coordinates ----------
 var tapDown = false, tapSX = 0, tapSY = 0, tapT = 0, coordMark = null;
 function coordTick(){
@@ -690,6 +704,7 @@ Events.run(EventType.Trigger.update, () => {
   if(Vars.state.isGame()){
     try{ detectTick(); }catch(err){}
     try{ coordTick(); }catch(err){}
+    ensureBar();
     if(respawnPos != null){
       if(Time.millis() > respawnPos.until) respawnPos = null;
       else if(Vars.player.dead()) Vars.player.set(respawnPos.x, respawnPos.y);
@@ -1078,7 +1093,9 @@ Events.on(EventType.ClientLoadEvent, e => {
     holder.setPosition(8, Core.graphics.getHeight() * 0.5);
     Core.settings.put("mt-pos", holder.x + "," + holder.y);
     buildBar();
-    toast("Quick bar restored");
+    try{ holder.remove(); Vars.ui.hudGroup.addChild(holder); holder.toFront(); }catch(err){}
+    holder.visible = true;
+    toast("Quick bar restored (" + Math.round(holder.getWidth()) + "x" + Math.round(holder.getHeight()) + " at " + Math.round(holder.x) + "," + Math.round(holder.y) + ", attached: " + (holder.parent != null) + ")");
   }
   // ----- resource monitor: items, rates, core full, power -----
   var rateRef = {}, monAt = 0;
@@ -1371,13 +1388,14 @@ Events.on(EventType.ClientLoadEvent, e => {
   barDrag = makeDrag(holder, "mt-pos", 8, Core.graphics.getHeight() * 0.5);
   var lastPacked = "", lastMon = S.monitor;
   holder.update(mkRun(() => {
-    holder.visible = Vars.state.isGame() && Vars.ui.hudfrag.shown;
+    holder.visible = Vars.state.isGame();
     if(S.monitor != lastMon){ lastMon = S.monitor; Core.app.post(mkRun(() => buildBar())); }
     if(S.monitor && holder.visible) updateMon();
     if(statusCache != lastPacked){ lastPacked = statusCache; holder.pack(); }
     barDrag.tick();
   }));
   Vars.ui.hudGroup.addChild(holder);
+  barRef = holder;
   Log.info("Mobile Tools: menu ready");
   }catch(err){
     Log.err(err);
